@@ -79,3 +79,7 @@ you might need to `sudo make install` or `doas make install`.
 ### Windows
 
 Open `rtptools.sln` on MS Visual Studio and press F7 to build.
+
+### Example Usage
+
+./rtpdump -y mpegts -d 2064 224.1.2.3/5678 > o.txt

@@ -52,6 +52,9 @@
 #include "payload.h"
 #include "rtpdump.h"
 #include "sysdep.h"
+#include "bitstream/mpeg/ts.h"
+#include "bitstream/mpeg/pes.h"
+
 
 #define RTPFILE_VERSION "1.0"
 
@@ -73,14 +76,47 @@ typedef enum {
 	F_ascii
 } t_format;
 
+typedef enum {
+    P_MPEGTS,
+    P_UNKNOWN
+} p_type;
+
 static void usage(const char *argv0)
 {
   fprintf(stderr, "usage: %s "
 	"[-F hex|ascii|rtcp|short|payload|dump|header] "
 	"[-f infile] [-o outfile] [-t minutes] [-x bytes] "
+        "[-d mpeg2ts pts pid] [-y mpegts]"
 	"[address]/port > file\n", argv0);
 }
 
+static int64_t get_pts_from_buf(unsigned char *buf, int len, int pid_num)
+{
+    int curr_len = 0;
+    unsigned char *ts_pkt;
+    unsigned char *pes_data;
+    int cur_pid;
+    int64_t ret_pts = -1;
+
+    while(curr_len < len)
+    {
+        ts_pkt = buf + curr_len;
+        cur_pid = ts_get_pid(ts_pkt);
+        if(cur_pid == pid_num)
+        {
+            if(ts_get_unitstart(ts_pkt))
+            {
+                pes_data = ts_payload(ts_pkt);
+                if(pes_has_pts(pes_data))
+                {
+                    ret_pts = pes_get_pts(pes_data);
+                }
+            }
+        }
+        curr_len += 188;
+    }
+    return ret_pts;
+}
 
 static void done(int sig)
 {
@@ -524,7 +560,8 @@ static int parse_control(FILE *out, char *buf, int len)
 */
 void packet_handler(FILE *out, t_format format, int trunc,
   double dstart, struct timeval now, int ctrl,
-  struct sockaddr_in sin, int len, RD_buffer_t *packet)
+                    struct sockaddr_in sin, int len, RD_buffer_t *packet,
+                    p_type payload_type, int pid_num)
 {
   double dnow = tdbl(&now);
   int hlen;   /* header length */
@@ -579,6 +616,15 @@ void packet_handler(FILE *out, t_format format, int trunc,
                 now.tv_sec, now.tv_usec, parse_type(ctrl, packet->p.data),
                 len, inet_ntoa(sin.sin_addr), ntohs(sin.sin_port));
         parse_data(out, packet->p.data, len);
+        if(payload_type == P_MPEGTS)
+        {
+          int64_t pts_val;
+          hlen = parse_header(packet->p.data);
+          pts_val = get_pts_from_buf(packet->p.data + hlen, (len - hlen), pid_num);
+          fprintf(out, "pts_val=%ld ", pts_val);
+
+
+        }
         if (format == F_hex) {
           hlen = parse_header(packet->p.data);
           fprintf(out, "data=");
@@ -604,6 +650,13 @@ void packet_handler(FILE *out, t_format format, int trunc,
 int main(int argc, char *argv[])
 {
   int c;
+  static struct {
+      const char *name;
+      p_type     payload_type;
+  } payloads[] = {
+      {"mpegts", P_MPEGTS},
+      {0,0}
+  };
   static struct {
     const char *name;
     t_format format;
@@ -633,11 +686,22 @@ int main(int argc, char *argv[])
   extern int optind;
   int i;
   int nfds = 0;
+  int pid_num = 0;
   extern double tdbl(struct timeval *);
+  p_type   payload_type = P_UNKNOWN;
 
   startupSocket();
-  while ((c = getopt(argc, argv, "F:f:o:t:x:h")) != EOF) {
+  while ((c = getopt(argc, argv, "F:f:o:t:x:y:d:h")) != EOF) {
     switch(c) {
+
+    case 'y':
+      for (i = 0; payloads[i].name; i++) {
+        if (strncasecmp(payloads[i].name, optarg, strlen(optarg)) == 0) {
+          payload_type = payloads[i].payload_type;
+          break;
+        }
+      }
+      break;
     /* output format */
     case 'F':
       format = F_invalid;
@@ -667,6 +731,11 @@ int main(int argc, char *argv[])
         perror(optarg);
         exit(1);
       }
+      break;
+
+    /* Pid number for which the pts has to be obtained */
+    case 'd':
+      pid_num = atoi(optarg);
       break;
 
     /* recording duration in minutes or fractions thereof */
@@ -772,7 +841,7 @@ int main(int argc, char *argv[])
 
           len = recvfrom(sock[i], packet.p.data, sizeof(packet.p.data),
             0, (struct sockaddr *)&sin, &alen);
-          packet_handler(out, format, trunc, dstart, now, i, sin, len, &packet);
+          packet_handler(out, format, trunc, dstart, now, i, sin, len, &packet, payload_type, pid_num);
         }
       }
     }
@@ -786,7 +855,7 @@ int main(int argc, char *argv[])
       i = (packet.p.hdr.plen == 0);
       /* arbitrary, obviously invalid value */
       sin.sin_addr.s_addr = INADDR_ANY; sin.sin_port = 0;
-      packet_handler(out, format, trunc, dstart, now, i, sin, len, &packet);
+      packet_handler(out, format, trunc, dstart, now, i, sin, len, &packet, payload_type, pid_num);
     }
   }
   return 0;
